@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 
 ################################################################
 class KinematicsDataset(Dataset):
@@ -54,6 +55,16 @@ class KinematicsDataset(Dataset):
         test_targets = torch.tensor(self.test_targets, dtype=torch.float32)
         return test_features, test_targets
 
+class _trivial_scaler():
+    def __init__(self,):
+        return
+    
+    def fit(self, x):
+        return self
+    
+    def transform(self, x):
+        return x
+
 # Example usage
 def prepare_dataset(dataframe, feature_cols, target_col, subject_col):
     """
@@ -78,7 +89,8 @@ def prepare_dataset(dataframe, feature_cols, target_col, subject_col):
 
 
 class SlidingWindowDataset(Dataset):
-    def __init__(self, dataframe, leave_out_subject, feature_cols, target_col, subject_col, window_length, step_size):
+    def __init__(self, dataframe, leave_out_subject, feature_cols, target_col, subject_col, window_length, step_size, 
+                targe_scaling=False, sequence_majority_voting=True):
         """
         Custom PyTorch Dataset with sliding window for leave-one-subject-out cross-validation.
 
@@ -91,8 +103,10 @@ class SlidingWindowDataset(Dataset):
             window_length (int): Length of each sliding window.
             step_size (int): Step size for sliding window.
         """
+        scaler = StandardScaler
         self.window_length = window_length
         self.step_size = step_size
+        self.feature_num = len(feature_cols)
 
         # Split data into training and test sets
         self.train_data = dataframe[dataframe[subject_col] != leave_out_subject]
@@ -101,6 +115,14 @@ class SlidingWindowDataset(Dataset):
         # Generate sliding windows
         self.train_windows = self._generate_windows(self.train_data, feature_cols, target_col, subject_col)
         self.test_windows = self._generate_windows(self.test_data, feature_cols, target_col, subject_col)
+        # scale data
+        train_features, train_targets = self.train_windows
+        test_features, test_targets = self.test_windows
+        feature_scaler = scaler().fit(train_features.reshape(-1, self.feature_num))
+        target_scaler = scaler().fit(train_targets.squeeze()) if targe_scaling else _trivial_scaler()
+        self.train_windows = feature_scaler.transform(train_features.reshape(-1, self.feature_num)).reshape(*train_features.shape), target_scaler.transform(train_targets.squeeze()).reshape(*train_targets.shape)
+        self.test_windows = feature_scaler.transform(test_features.reshape(-1, self.feature_num)).reshape(*test_features.shape), target_scaler.transform(test_targets.squeeze()).reshape(*test_targets.shape)
+        self.feature_scaler, self.target_scaler = feature_scaler, target_scaler # save scaler
 
     def _generate_windows(self, data, feature_cols, target_col, subject_col):
         """
@@ -124,33 +146,34 @@ class SlidingWindowDataset(Dataset):
             subject_data = data[data[subject_col] == subject]
             features = subject_data[feature_cols].values
             targets = subject_data[target_col].values
-
+            features = features.reshape(*features.shape[:1], -1)
+            targets = targets.reshape(*targets.shape[:1], -1)  # make sure targets have the same shape as features
             if len(features) < self.window_length:
+                    # TODO: this is a very rare case handling, not the implementation for zero padding
                 # Handle case where data is shorter than window length
                 padded_features = np.zeros((self.window_length, features.shape[1]), dtype=np.float32)
-                padded_targets = np.zeros((self.window_length,), dtype=np.float32)
+                padded_targets = np.zeros((self.window_length, targets.shape[1]), dtype=np.float32)
                 padded_features[:len(features)] = features
                 padded_targets[:len(targets)] = targets
 
                 features_list.append(padded_features[np.newaxis, ...])  # Add new axis to match shape
                 targets_list.append(padded_targets[np.newaxis, ...])  # Add new axis to match shape
-            else:
-                # Generate sliding windows
-                feature_windows = np.lib.stride_tricks.sliding_window_view(
-                    features, (self.window_length, features.shape[1])
-                )[::self.step_size, 0, :, :]
-                target_windows = np.lib.stride_tricks.sliding_window_view(
-                    targets, self.window_length
-                )[::self.step_size, 0, :]
+            # Generate sliding windows
+            feature_windows = np.lib.stride_tricks.sliding_window_view(
+                features, (self.window_length, features.shape[-1])
+            )[::self.step_size, 0, :, :]
+            target_windows = np.lib.stride_tricks.sliding_window_view(
+                targets, (self.window_length, targets.shape[-1])
+            )[::self.step_size, 0, :, :]
 
-                features_list.append(feature_windows)
-                targets_list.append(target_windows)
+            features_list.append(feature_windows)
+            targets_list.append(target_windows)
 
         # Concatenate all windows
         all_features = np.concatenate(features_list, axis=0)
         all_targets = np.concatenate(targets_list, axis=0)
-
-        return all_features, all_targets
+        all_targets = all_targets.mean(axis=-2)
+        return all_features, all_targets    # shape: (N, L, D) where L is the sequence length and D the number of features
 
     def __len__(self):
         return len(self.train_windows[0])
@@ -184,6 +207,19 @@ class SlidingWindowDataset(Dataset):
             torch.tensor(test_features, dtype=torch.float32),
             torch.tensor(test_targets, dtype=torch.float32)
         )
+    
+    def get_train_data(self):
+        """
+        Get the test set for the current subject.
+
+        Returns:
+            tuple: Test features and targets.
+        """
+        train_features, train_targets = self.train_windows
+        return (
+            torch.tensor(train_features, dtype=torch.float32),
+            torch.tensor(train_targets, dtype=torch.float32)
+        )
 
 # Example usage
 def prepare_sliding_window_dataset(dataframe, feature_cols, target_col, subject_col, window_length, step_size):
@@ -210,3 +246,45 @@ def prepare_sliding_window_dataset(dataframe, feature_cols, target_col, subject_
         )
     
     return datasets
+
+
+def create_weighted_sampler(dataset, num_bins=10):
+    """
+    Create a weighted sampler for imbalanced pain levels in the dataset.
+
+    Args:
+        dataset (Dataset): The PyTorch dataset (e.g., SlidingWindowDataset).
+        num_bins (int): Number of bins to discretize the pain levels (default: 10).
+
+    Returns:
+        WeightedRandomSampler: A sampler that weights samples based on bin frequencies.
+    """
+    # Get all targets from the dataset
+    all_targets = []
+    for _, target in dataset:
+        target = target.numpy().squeeze().mean(keepdims=True)  #
+        if len(target.shape) <= 1:
+            target = np.array([target])  # expand dimension
+        all_targets.extend(target)
+    all_targets = np.array(all_targets)
+
+    # Discretize pain levels into bins
+    bin_edges = np.linspace(0, 1, num_bins + 1)  # Create bin edges from 0 to 1
+    bins = np.digitize(all_targets, bins=bin_edges, right=True)  # Assign each pain level to a bin
+
+    # Calculate bin frequencies
+    bin_counts = np.bincount(bins, minlength=num_bins + 1)  # Add +1 for edge cases
+    bin_counts = bin_counts[1:]  # Ignore bin 0 (values < bin_edges[0])
+
+    # Compute weights inversely proportional to bin frequencies
+    bin_weights = 1.0 / (bin_counts + 1e-6)  # Add small epsilon to avoid division by zero
+    sample_weights = bin_weights[bins - 1]  # Assign weight to each sample based on its bin
+
+    # Create a WeightedRandomSampler
+    sampler = WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.float),
+        num_samples=len(sample_weights),  # Total number of samples
+        replacement=True  # Allow replacement for balanced sampling
+    )
+
+    return sampler

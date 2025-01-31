@@ -10,10 +10,17 @@ __version__ = '1.0.0'
 
 import logging
 logging.basicConfig(level=logging.INFO)
-logging.info("Initializing mypackage...")
+logging.info("Initializing utils package...")
 
-from .EmoPainDataset import KinematicsDataset, function1
-__all__ = ['Class1', 'function1', 'Class2']  # Limits what is imported with "from mypackage import *"
+from .EmoPainDataset import KinematicsDataset, SlidingWindowDataset
+from .models import KinematicsTransformer
+
+""" 
+__all__ = [ # Limits what is imported
+    'KinematicsDataset',
+    'SlidingWindowDataset',
+    'KinematicsTransformer',
+    ]  """
 
 CONFIG = {
     'version': __version__,
